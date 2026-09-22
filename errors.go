@@ -139,30 +139,68 @@ const minDetectableSecret = 8
 // and dropping the whole thing when it is, keeps every untainted reason intact.
 func containsSecret(body []byte, secrets []string) bool {
 	s := string(body)
-	// Percent-decoded as well, so an echo that came back re-encoded differently
-	// from how the form sent it (%20 for a space where the encoder wrote +, or
-	// lowercase hex) still matches the plain secret. A body that is not a valid
-	// encoding is left alone.
-	decoded, err := url.QueryUnescape(s)
-	if err != nil {
-		decoded = ""
-	}
+	// Percent-decoded as well, so an echo re-encoded differently from how the
+	// form sent it (%20 for a space where the form encoder wrote +, or
+	// lowercase hex) still matches the plain secret.
+	decoded := tolerantUnescape(s)
 
 	for _, secret := range secrets {
 		if len(secret) < minDetectableSecret {
 			continue
 		}
 		encoded := url.QueryEscape(secret)
-		for _, haystack := range []string{s, decoded} {
-			if haystack == "" {
-				continue
-			}
-			if strings.Contains(haystack, secret) || strings.Contains(haystack, encoded) {
-				return true
-			}
+		if strings.Contains(s, secret) || strings.Contains(s, encoded) ||
+			strings.Contains(decoded, secret) || strings.Contains(decoded, encoded) {
+			return true
 		}
 	}
 	return false
+}
+
+// tolerantUnescape decodes the %XX sequences in s and leaves everything else
+// exactly as it was, including a % that begins no valid escape.
+//
+// url.QueryUnescape cannot be used here because it is all or nothing: one
+// stray percent sign, as in "quota 100% used", makes it fail and return no
+// string at all. Treating that as "nothing to check" disabled the decoded pass
+// for the whole response, and a body reading "quota 100% used; rejected
+// password=correct%20horse%20battery%20staple" walked the password straight
+// into the error.
+//
+// '+' is deliberately not treated as a space. The form spelling of a secret is
+// already matched directly, and decoding '+' here would only add ways for an
+// innocent body to look like an echo.
+func tolerantUnescape(s string) string {
+	if !strings.ContainsRune(s, '%') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '%' && i+2 < len(s) && isHexDigit(s[i+1]) && isHexDigit(s[i+2]) {
+			b.WriteByte(unhexDigit(s[i+1])<<4 | unhexDigit(s[i+2]))
+			i += 3
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func unhexDigit(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
 }
 
 // bodySnippet returns a bounded, single-line quote of an unrecognized response

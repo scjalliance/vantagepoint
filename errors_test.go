@@ -255,6 +255,53 @@ func TestTokenErrorCatchesAlternatePercentEncoding(t *testing.T) {
 	}
 }
 
+// url.QueryUnescape fails outright on a stray percent sign, and error prose
+// carries them ("quota 100% used"). Treating that failure as "nothing to
+// check" disabled the decoded pass for the whole response.
+func TestTokenErrorCatchesEncodedEchoBesideStrayPercent(t *testing.T) {
+	const password = "correct horse battery staple"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"message":"quota 100% used; rejected password=correct%20horse%20battery%20staple"}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
+	err := c.Authenticate(context.Background(), "user", password)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "correct%20horse") {
+		t.Errorf("the encoded password reached the error: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), echoedCredentialsDetail) {
+		t.Errorf("error = %q, want the withheld-response detail", err.Error())
+	}
+}
+
+func TestTolerantUnescape(t *testing.T) {
+	for _, tt := range []struct {
+		in, want string
+	}{
+		{"nothing to do", "nothing to do"},
+		{"a%20b", "a b"},
+		{"a%2fb", "a/b"},
+		{"a%2Fb", "a/b"},
+		// A stray percent stays put rather than voiding the whole string.
+		{"quota 100% used; a%20b", "quota 100% used; a b"},
+		{"trailing %", "trailing %"},
+		{"short %a", "short %a"},
+		// '+' is left alone on purpose.
+		{"a+b", "a+b"},
+	} {
+		if got := tolerantUnescape(tt.in); got != tt.want {
+			t.Errorf("tolerantUnescape(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 // The REST paths send the access token in a header and quote unrecognized
 // bodies, so an echoing gateway could hand the bearer token back.
 func TestRESTErrorWithholdsEchoedBearerToken(t *testing.T) {
