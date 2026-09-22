@@ -188,6 +188,19 @@ const maxErrorBodyRead = 64 << 10
 
 // parseErrorResponse reads an error response body and returns an appropriate APIError.
 func parseErrorResponse(resp *http.Response) error {
+	return parseErrorResponseBody(resp, true)
+}
+
+// parseCredentialErrorResponse is parseErrorResponse for a request whose body
+// carried credentials. It reads both of Vantagepoint's error shapes as usual,
+// but will not quote an unrecognized body: a gateway that answers a POST with
+// an error page echoing the submitted form would otherwise copy the password
+// and client secret into an error that reaches logs and the weekly report.
+func parseCredentialErrorResponse(resp *http.Response) error {
+	return parseErrorResponseBody(resp, false)
+}
+
+func parseErrorResponseBody(resp *http.Response, quoteBody bool) error {
 	// Read rather than stream-decode, so parseAPIError can try both of
 	// Vantagepoint's error shapes and still quote the raw body if it is
 	// neither.
@@ -199,5 +212,5 @@ func parseErrorResponse(resp *http.Response) error {
 			Detail:     fmt.Sprintf("the error body could not be read: %v", err),
 		}
 	}
-	return parseAPIError(resp.StatusCode, body)
+	return parseAPIError(resp.StatusCode, body, quoteBody)
 }

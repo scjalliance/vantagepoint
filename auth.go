@@ -97,7 +97,10 @@ func (c *Client) requestToken(ctx context.Context, form url.Values) (*tokenInfo,
 		// the one the REST endpoints use, so this goes through the shared
 		// parser. Decoding it straight into an APIError used to succeed with
 		// every field empty, and a rejected login carried no reason at all.
-		return nil, parseErrorResponse(resp)
+		//
+		// The credential variant: this request posted the password and client
+		// secret, so an unrecognized body is never quoted back.
+		return nil, parseCredentialErrorResponse(resp)
 	}
 
 	var tok tokenInfo

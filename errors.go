@@ -1,10 +1,12 @@
 package vantagepoint
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // Sentinel errors for common API error conditions.
@@ -50,6 +52,10 @@ const (
 	snippetEllipsis     = "..."
 )
 
+// withheldBodyDetail stands in for an unrecognized body that must not be
+// quoted. It says a body arrived without repeating it.
+const withheldBodyDetail = "the response was not a recognized error shape; its body is withheld because the request carried credentials"
+
 // parseAPIError builds an APIError from an error response body.
 //
 // Vantagepoint answers with two different error shapes. The REST endpoints
@@ -60,9 +66,12 @@ const (
 // after the colon.
 //
 // A body that is neither shape, such as an HTML page from a proxy or an empty
-// response, falls back to the status line plus a bounded quote of whatever did
-// arrive, so a caller is never handed a blank reason.
-func parseAPIError(statusCode int, body []byte) *APIError {
+// response, falls back to the status line so a caller is never handed a blank
+// reason. quoteBody decides whether that fallback also quotes what arrived:
+// true for the REST endpoints, where the quote usually identifies the hop that
+// produced the page, and false for /token, whose request body carries the
+// password and client secret that such a page may echo back.
+func parseAPIError(statusCode int, body []byte, quoteBody bool) *APIError {
 	var parsed struct {
 		Message          string `json:"message"`
 		Detail           string `json:"detail"`
@@ -87,8 +96,13 @@ func parseAPIError(statusCode int, body []byte) *APIError {
 
 	if message == "" {
 		message = fmt.Sprintf("request failed with status %d", statusCode)
-		if snippet := bodySnippet(body); snippet != "" {
-			detail = snippet
+		switch {
+		case quoteBody:
+			if snippet := bodySnippet(body); snippet != "" {
+				detail = snippet
+			}
+		case len(bytes.TrimSpace(body)) > 0:
+			detail = withheldBodyDetail
 		}
 	}
 
@@ -97,6 +111,9 @@ func parseAPIError(statusCode int, body []byte) *APIError {
 
 // bodySnippet returns a bounded, single-line quote of an unrecognized response
 // body, or "" when there is nothing worth quoting.
+//
+// The result is always valid UTF-8. It reaches a log line, an HTML report, and
+// an email, and a JSON encoder would silently rewrite a broken rune anyway.
 func bodySnippet(body []byte) string {
 	s := strings.TrimSpace(string(body))
 	if s == "" {
@@ -106,9 +123,17 @@ func bodySnippet(body []byte) string {
 	// multi-line HTML dump would bury the surrounding context.
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > maxErrorBodySnippet {
-		s = s[:maxErrorBodySnippet] + snippetEllipsis
+		// Back up to a rune boundary first: cutting at a fixed byte offset
+		// splits a multi-byte rune and leaves the tail invalid.
+		cut := maxErrorBodySnippet
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut] + snippetEllipsis
 	}
-	return s
+	// A body that was never UTF-8 to begin with, such as a binary payload from
+	// a confused gateway, still has to come out well-formed.
+	return strings.ToValidUTF8(s, "�")
 }
 
 // Error implements the error interface for APIError.
