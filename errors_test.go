@@ -206,6 +206,55 @@ func TestTokenErrorCatchesPercentEncodedEcho(t *testing.T) {
 	}
 }
 
+// A JSON encoder is free to escape characters it does not have to, so an
+// echoed password can arrive as "P&ssw0rd" where the raw bytes never
+// spell the secret. The decoded message does.
+func TestTokenErrorCatchesUnicodeEscapedEcho(t *testing.T) {
+	const password = "P&ssw0rd-lives-here"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		// The ampersand written as &, the way Go's own encoder would.
+		fmt.Fprint(w, `{"error":"invalid_grant","error_description":"bad login for P&ssw0rd-lives-here"}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
+	err := c.Authenticate(context.Background(), "user", password)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Errorf("the password reached the error: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), echoedCredentialsDetail) {
+		t.Errorf("error = %q, want the withheld-response detail", err.Error())
+	}
+}
+
+// An echo can also come back re-encoded differently from how the form sent it,
+// with %20 for a space where the form encoder wrote +.
+func TestTokenErrorCatchesAlternatePercentEncoding(t *testing.T) {
+	const password = "correct horse battery staple"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"message":"rejected: password=correct%20horse%20battery%20staple"}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
+	err := c.Authenticate(context.Background(), "user", password)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), echoedCredentialsDetail) {
+		t.Errorf("error = %q, want the withheld-response detail", err.Error())
+	}
+}
+
 // The REST paths send the access token in a header and quote unrecognized
 // bodies, so an echoing gateway could hand the bearer token back.
 func TestRESTErrorWithholdsEchoedBearerToken(t *testing.T) {

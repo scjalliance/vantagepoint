@@ -216,15 +216,18 @@ func parseErrorResponseBody(resp *http.Response, quoteBody bool, secrets []strin
 			Detail:     fmt.Sprintf("the error body could not be read: %v", err),
 		}
 	}
-	// Checked before parsing, so it applies whatever shape the body took. A
-	// gateway can echo a request inside Vantagepoint's own error fields as
-	// easily as in an HTML page, and those fields are read as the reason.
-	if containsSecret(body, secrets) {
+	apiErr := parseAPIError(resp.StatusCode, body, quoteBody)
+
+	// Judged on the raw body and on what came out of it. A JSON encoder is free
+	// to write "P&ssw0rd" for "P&ssw0rd", which the raw bytes do not match
+	// but the decoded message does; checking only the parsed fields would in
+	// turn miss an echo in a body shape the parser ignored.
+	if containsSecret(body, secrets) || containsSecret([]byte(apiErr.Message+"\x00"+apiErr.Detail), secrets) {
 		return &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    fmt.Sprintf("request failed with status %d", resp.StatusCode),
 			Detail:     echoedCredentialsDetail,
 		}
 	}
-	return parseAPIError(resp.StatusCode, body, quoteBody)
+	return apiErr
 }

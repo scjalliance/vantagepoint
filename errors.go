@@ -139,12 +139,27 @@ const minDetectableSecret = 8
 // and dropping the whole thing when it is, keeps every untainted reason intact.
 func containsSecret(body []byte, secrets []string) bool {
 	s := string(body)
+	// Percent-decoded as well, so an echo that came back re-encoded differently
+	// from how the form sent it (%20 for a space where the encoder wrote +, or
+	// lowercase hex) still matches the plain secret. A body that is not a valid
+	// encoding is left alone.
+	decoded, err := url.QueryUnescape(s)
+	if err != nil {
+		decoded = ""
+	}
+
 	for _, secret := range secrets {
 		if len(secret) < minDetectableSecret {
 			continue
 		}
-		if strings.Contains(s, secret) || strings.Contains(s, url.QueryEscape(secret)) {
-			return true
+		encoded := url.QueryEscape(secret)
+		for _, haystack := range []string{s, decoded} {
+			if haystack == "" {
+				continue
+			}
+			if strings.Contains(haystack, secret) || strings.Contains(haystack, encoded) {
+				return true
+			}
 		}
 	}
 	return false

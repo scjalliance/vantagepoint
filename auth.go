@@ -100,8 +100,8 @@ func (c *Client) requestToken(ctx context.Context, form url.Values) (*tokenInfo,
 		//
 		// The credential variant: this request posted the password, the client
 		// secret, and on a refresh the refresh token. An unrecognized body is
-		// never quoted back, and any of those values echoed inside a recognized
-		// one is redacted. Read from the form so every grant type is covered by
+		// never quoted back, and a response that repeats any of those values is
+		// withheld in full. Read from the form so every grant type is covered by
 		// the values it actually sent.
 		return nil, parseCredentialErrorResponse(resp,
 			form.Get("password"),
