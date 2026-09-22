@@ -89,7 +89,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return parseErrorResponse(resp)
+		return parseErrorResponse(resp, tok)
 	}
 
 	if result != nil && resp.StatusCode != http.StatusNoContent {
@@ -133,7 +133,7 @@ func (c *Client) doPostAsGet(ctx context.Context, path string, query url.Values,
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return parseErrorResponse(resp)
+		return parseErrorResponse(resp, tok)
 	}
 
 	if result != nil {
@@ -180,15 +180,64 @@ func (c *Client) RawGet(ctx context.Context, path string, q *Query, result any) 
 	return c.get(ctx, path, q, result)
 }
 
-// parseErrorResponse reads an error response body and returns an appropriate APIError.
-func parseErrorResponse(resp *http.Response) error {
-	var apiErr APIError
-	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
-		apiErr = APIError{
+// maxErrorBodyRead bounds how much of an error response is read before it is
+// parsed. An error body is a sentence or a small JSON object; anything larger
+// is a misrouted page, and reading it in full would cost memory for no
+// diagnostic gain.
+const maxErrorBodyRead = 64 << 10
+
+// parseErrorResponse reads an error response body and returns an appropriate
+// APIError. The secrets are values the request carried that must not come back
+// out in the error, such as the bearer token in the Authorization header.
+func parseErrorResponse(resp *http.Response, secrets ...string) error {
+	return parseErrorResponseBody(resp, true, secrets)
+}
+
+// parseCredentialErrorResponse is parseErrorResponse for a request whose body
+// carried credentials.
+//
+// It reads both of Vantagepoint's error shapes as usual, but will not quote an
+// unrecognized body. A gateway that answers a POST with a page echoing the
+// submitted form would otherwise copy the password and client secret into an
+// error that reaches logs and the weekly report.
+func parseCredentialErrorResponse(resp *http.Response, secrets ...string) error {
+	return parseErrorResponseBody(resp, false, secrets)
+}
+
+func parseErrorResponseBody(resp *http.Response, quoteBody bool, secrets []string) error {
+	// Read rather than stream-decode, so parseAPIError can try both of
+	// Vantagepoint's error shapes and still quote the raw body if it is
+	// neither.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyRead))
+	if err != nil {
+		return &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    fmt.Sprintf("request failed with status %d", resp.StatusCode),
+			Detail:     fmt.Sprintf("the error body could not be read: %v", err),
 		}
 	}
-	apiErr.StatusCode = resp.StatusCode
-	return &apiErr
+	apiErr := parseAPIError(resp.StatusCode, body, quoteBody)
+
+	// A short secret is worth matching exactly where the request carried it.
+	// quoteBody is false on that path and only there, so it selects the floor
+	// as well: an eight-character password is realistic and would otherwise
+	// reach the error through error_description untouched.
+	minLen := minDetectableSecret
+	if !quoteBody {
+		minLen = noSecretLengthFloor
+	}
+
+	// Judged on the raw body and on what came out of it. A JSON encoder is free
+	// to escape characters it need not, writing & for "&", which the raw
+	// bytes do not match but the decoded message does; checking only the parsed
+	// fields would in turn miss an echo in a body shape the parser ignored.
+	if containsSecret(body, secrets, minLen) ||
+		containsSecret([]byte(apiErr.Message+"\x00"+apiErr.Detail), secrets, minLen) {
+		return &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    fmt.Sprintf("request failed with status %d", resp.StatusCode),
+			Detail:     echoedCredentialsDetail,
+		}
+	}
+	return apiErr
 }
