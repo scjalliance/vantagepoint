@@ -302,6 +302,11 @@ func TestTokenErrorCatchesMixedPlusAndPercentEcho(t *testing.T) {
 	if strings.Contains(err.Error(), "secret+pass") {
 		t.Errorf("the encoded password reached the error: %q", err.Error())
 	}
+	// Also in decoded form, so this still fails for the right reason if the
+	// withholding path ever quotes a decoded body rather than the raw one.
+	if strings.Contains(err.Error(), password) {
+		t.Errorf("the password reached the error: %q", err.Error())
+	}
 	if !strings.Contains(err.Error(), echoedCredentialsDetail) {
 		t.Errorf("error = %q, want the withheld-response detail", err.Error())
 	}

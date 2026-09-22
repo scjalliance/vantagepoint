@@ -128,9 +128,11 @@ const minDetectableSecret = 8
 
 // containsSecret reports whether body carries any of the given secrets.
 //
-// Both spellings are checked. A token request goes out as an encoded form, so
-// an echo of it arrives percent-encoded: a password of "P@ssw0rd Hunter!"
-// comes back as "P%40ssw0rd+Hunter%21".
+// Three spellings of the body are searched, for two spellings of each secret.
+// A token request goes out as an encoded form, so an echo of it comes back
+// encoded, but not necessarily the way Go would have written it: the hex case
+// may differ, a space may be "+" or "%20", and a body can mix the two. The
+// combinations are enumerated in the function rather than reasoned about.
 //
 // This replaced an earlier attempt that cut the secrets out of the message with
 // string replacement. Substring surgery mangled innocent text that happened to
@@ -149,6 +151,10 @@ func containsSecret(body []byte, secrets []string) bool {
 	// withheld error body; missing a real echo costs a credential, so the
 	// asymmetry decides it. minDetectableSecret keeps the false-positive rate
 	// negligible in practice.
+	//
+	// The '+' replacement happens before the unescape, not after, so a secret
+	// containing a literal '+' (which a form encodes as %2B) is not mangled
+	// into a space. Reversing the two would break that case.
 	haystacks := [3]string{s, tolerantUnescape(s), tolerantUnescape(strings.ReplaceAll(s, "+", " "))}
 
 	for _, secret := range secrets {
@@ -175,9 +181,12 @@ func containsSecret(body []byte, secrets []string) bool {
 // password=correct%20horse%20battery%20staple" walked the password straight
 // into the error.
 //
-// '+' is deliberately not treated as a space. The form spelling of a secret is
-// already matched directly, and decoding '+' here would only add ways for an
-// innocent body to look like an echo.
+// '+' is not treated as a space here, because this function does not know
+// whether it is looking at form-encoded text. Reading '+' as a space is the
+// caller's job, and containsSecret does exactly that for one of its three
+// haystacks. Do not fold that into this function, and do not drop it from the
+// caller as redundant: an echo spelled "secret+pass%2fword" matches nothing
+// without it, which is a leak this code has already had once.
 func tolerantUnescape(s string) string {
 	if !strings.ContainsRune(s, '%') {
 		return s
