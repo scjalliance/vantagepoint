@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -143,7 +144,7 @@ func TestTokenErrorDoesNotQuoteUnrecognizedBody(t *testing.T) {
 // Withholding the raw body is not enough on its own. A gateway can answer in
 // Vantagepoint's own error shape, and an echoed request then arrives inside a
 // field the parser reads and reports as the reason.
-func TestTokenErrorRedactsEchoedCredentials(t *testing.T) {
+func TestTokenErrorWithholdsEchoedCredentials(t *testing.T) {
 	const (
 		password     = "hunter2-should-never-appear"
 		clientSecret = "client-secret-should-never-appear"
@@ -171,21 +172,82 @@ func TestTokenErrorRedactsEchoedCredentials(t *testing.T) {
 	if strings.Contains(err.Error(), clientSecret) {
 		t.Errorf("the client secret reached the error: %q", err.Error())
 	}
-	if !strings.Contains(err.Error(), redactedMarker) {
-		t.Errorf("error = %q, want the redaction marker", err.Error())
+	if !strings.Contains(err.Error(), echoedCredentialsDetail) {
+		t.Errorf("error = %q, want the withheld-response detail", err.Error())
 	}
 }
 
-// A refresh posts the refresh token rather than the password, so the redaction
+// The token request goes out as an encoded form, so an echo of it comes back
+// percent-encoded. Matching only the plain spelling would miss every password
+// containing a character the form encoder escapes.
+func TestTokenErrorCatchesPercentEncodedEcho(t *testing.T) {
+	const password = "P@ssw0rd Hunter!#$"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		// Echoed exactly as it arrived on the wire, still encoded.
+		fmt.Fprintf(w, `{"message":%q}`, "rejected: "+string(body))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
+	err := c.Authenticate(context.Background(), "user", password)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	if strings.Contains(err.Error(), url.QueryEscape(password)) {
+		t.Errorf("the encoded password reached the error: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), echoedCredentialsDetail) {
+		t.Errorf("error = %q, want the withheld-response detail", err.Error())
+	}
+}
+
+// The REST paths send the access token in a header and quote unrecognized
+// bodies, so an echoing gateway could hand the bearer token back.
+func TestRESTErrorWithholdsEchoedBearerToken(t *testing.T) {
+	const accessToken = "access-token-should-never-appear"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/token") {
+			fmt.Fprintf(w, `{"access_token":%q,"token_type":"bearer","expires_in":3600}`, accessToken)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, "<html><body>blocked request with Authorization: %s</body></html>",
+			r.Header.Get("Authorization"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
+	if err := c.Authenticate(context.Background(), "user", "test-password-value"); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	var out any
+	err := c.RawGet(context.Background(), "/Projects", nil, &out)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), accessToken) {
+		t.Errorf("the access token reached the error: %q", err.Error())
+	}
+}
+
+// A refresh posts the refresh token rather than the password, so the check
 // has to follow whatever the form actually carried.
-func TestRefreshErrorRedactsRefreshToken(t *testing.T) {
+func TestRefreshErrorWithholdsEchoedRefreshToken(t *testing.T) {
 	const refreshToken = "refresh-token-should-never-appear"
 
 	var issued bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !issued {
 			issued = true
-			fmt.Fprintf(w, `{"access_token":"t","token_type":"bearer","expires_in":3600,"refresh_token":%q}`, refreshToken)
+			fmt.Fprintf(w, `{"access_token":"test-access-token-value","token_type":"bearer","expires_in":3600,"refresh_token":%q}`, refreshToken)
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -195,7 +257,7 @@ func TestRefreshErrorRedactsRefreshToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "db", "id", "secret")
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
 	if err := c.Authenticate(context.Background(), "user", "test-password-value"); err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
@@ -257,7 +319,7 @@ func TestParseAPIErrorKeepsContentWhenBodyStartsMidRune(t *testing.T) {
 func TestRESTErrorStillQuotesUnrecognizedBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/token") {
-			w.Write([]byte(`{"access_token":"t","token_type":"bearer","expires_in":3600}`))
+			w.Write([]byte(`{"access_token":"test-access-token-value","token_type":"bearer","expires_in":3600}`))
 			return
 		}
 		w.Header().Set("Content-Type", "text/html")
@@ -266,7 +328,7 @@ func TestRESTErrorStillQuotesUnrecognizedBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "db", "id", "secret")
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
 	if err := c.Authenticate(context.Background(), "user", "test-password-value"); err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
@@ -324,7 +386,7 @@ func TestAuthenticateReportsServerReason(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "db", "id", "secret")
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
 	err := c.Authenticate(context.Background(), "user", "test-password-value")
 	if err == nil {
 		t.Fatal("expected an error")
@@ -342,7 +404,7 @@ func TestAuthenticateReportsServerReason(t *testing.T) {
 func TestRequestReportsServerReason(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/token") {
-			w.Write([]byte(`{"access_token":"t","token_type":"bearer","expires_in":3600}`))
+			w.Write([]byte(`{"access_token":"test-access-token-value","token_type":"bearer","expires_in":3600}`))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json;charset=UTF-8")
@@ -351,7 +413,7 @@ func TestRequestReportsServerReason(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "db", "id", "secret")
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
 	if err := c.Authenticate(context.Background(), "user", "test-password-value"); err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}

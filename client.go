@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -90,7 +89,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return parseErrorResponse(resp)
+		return parseErrorResponse(resp, tok)
 	}
 
 	if result != nil && resp.StatusCode != http.StatusNoContent {
@@ -134,7 +133,7 @@ func (c *Client) doPostAsGet(ctx context.Context, path string, query url.Values,
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return parseErrorResponse(resp)
+		return parseErrorResponse(resp, tok)
 	}
 
 	if result != nil {
@@ -187,30 +186,25 @@ func (c *Client) RawGet(ctx context.Context, path string, q *Query, result any) 
 // diagnostic gain.
 const maxErrorBodyRead = 64 << 10
 
-// parseErrorResponse reads an error response body and returns an appropriate APIError.
-func parseErrorResponse(resp *http.Response) error {
-	return parseErrorResponseBody(resp, true)
+// parseErrorResponse reads an error response body and returns an appropriate
+// APIError. The secrets are values the request carried that must not come back
+// out in the error, such as the bearer token in the Authorization header.
+func parseErrorResponse(resp *http.Response, secrets ...string) error {
+	return parseErrorResponseBody(resp, true, secrets)
 }
 
 // parseCredentialErrorResponse is parseErrorResponse for a request whose body
-// carried credentials, which are passed in as secrets.
+// carried credentials.
 //
 // It reads both of Vantagepoint's error shapes as usual, but will not quote an
-// unrecognized body, and redacts the secrets from whatever reason it does
-// produce. A gateway that answers a POST with a page echoing the submitted form
-// would otherwise copy the password and client secret into an error that
-// reaches logs and the weekly report, and it can do that inside a JSON error
-// shape as easily as in an HTML page.
+// unrecognized body. A gateway that answers a POST with a page echoing the
+// submitted form would otherwise copy the password and client secret into an
+// error that reaches logs and the weekly report.
 func parseCredentialErrorResponse(resp *http.Response, secrets ...string) error {
-	err := parseErrorResponseBody(resp, false)
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
-		apiErr.redact(secrets)
-	}
-	return err
+	return parseErrorResponseBody(resp, false, secrets)
 }
 
-func parseErrorResponseBody(resp *http.Response, quoteBody bool) error {
+func parseErrorResponseBody(resp *http.Response, quoteBody bool, secrets []string) error {
 	// Read rather than stream-decode, so parseAPIError can try both of
 	// Vantagepoint's error shapes and still quote the raw body if it is
 	// neither.
@@ -220,6 +214,16 @@ func parseErrorResponseBody(resp *http.Response, quoteBody bool) error {
 			StatusCode: resp.StatusCode,
 			Message:    fmt.Sprintf("request failed with status %d", resp.StatusCode),
 			Detail:     fmt.Sprintf("the error body could not be read: %v", err),
+		}
+	}
+	// Checked before parsing, so it applies whatever shape the body took. A
+	// gateway can echo a request inside Vantagepoint's own error fields as
+	// easily as in an HTML page, and those fields are read as the reason.
+	if containsSecret(body, secrets) {
+		return &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    fmt.Sprintf("request failed with status %d", resp.StatusCode),
+			Detail:     echoedCredentialsDetail,
 		}
 	}
 	return parseAPIError(resp.StatusCode, body, quoteBody)

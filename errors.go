@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 )
@@ -112,34 +113,41 @@ func parseAPIError(statusCode int, body []byte, quoteBody bool) *APIError {
 	return &APIError{StatusCode: statusCode, Message: message, Detail: detail}
 }
 
-// minRedactableSecret is the shortest value redact will look for.
-//
-// Substring redaction cannot tell a secret from a coincidence, and below this
-// length the coincidence is the likely case: a four-character password of
-// "pass" turns "Please update the password" into "Please update the
-// [redacted]word", mangling the one sentence the caller needs to read. Eight
-// characters is past the point where an accidental match is plausible, and no
-// real Vantagepoint API credential is shorter.
-const minRedactableSecret = 8
+// echoedCredentialsDetail stands in for a response that gave back something the
+// request had sent in confidence.
+const echoedCredentialsDetail = "the response repeated credentials from the request, so it is withheld in full"
 
-// redactedMarker replaces a secret found in an error message.
-const redactedMarker = "[redacted]"
-
-// redact removes the given secrets from an error built from a response to a
-// request that carried them.
+// minDetectableSecret is the shortest value containsSecret will look for.
 //
-// Withholding an unrecognized body is not enough on its own: a gateway can
-// answer in Vantagepoint's own error shape, and an echoed request would then
-// arrive inside "message" or "error_description" and be reported as the reason.
-// This is the second line, applied whatever shape the body took.
-func (e *APIError) redact(secrets []string) {
+// Substring matching cannot tell a secret from a coincidence, and a short
+// value is nearly all coincidence: a one-character token matches every body
+// containing that letter, which would withhold the reason from every error.
+// Below this length the check is skipped rather than allowed to fire on
+// everything. Real Vantagepoint credentials and bearer tokens are far longer.
+const minDetectableSecret = 8
+
+// containsSecret reports whether body carries any of the given secrets.
+//
+// Both spellings are checked. A token request goes out as an encoded form, so
+// an echo of it arrives percent-encoded: a password of "P@ssw0rd Hunter!"
+// comes back as "P%40ssw0rd+Hunter%21".
+//
+// This replaced an earlier attempt that cut the secrets out of the message with
+// string replacement. Substring surgery mangled innocent text that happened to
+// contain a short secret, turning "Please update the password" into "Please
+// update the [redacted]word". Deciding once whether the response is tainted,
+// and dropping the whole thing when it is, keeps every untainted reason intact.
+func containsSecret(body []byte, secrets []string) bool {
+	s := string(body)
 	for _, secret := range secrets {
-		if len(secret) < minRedactableSecret {
+		if len(secret) < minDetectableSecret {
 			continue
 		}
-		e.Message = strings.ReplaceAll(e.Message, secret, redactedMarker)
-		e.Detail = strings.ReplaceAll(e.Detail, secret, redactedMarker)
+		if strings.Contains(s, secret) || strings.Contains(s, url.QueryEscape(secret)) {
+			return true
+		}
 	}
+	return false
 }
 
 // bodySnippet returns a bounded, single-line quote of an unrecognized response
