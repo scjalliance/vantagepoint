@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -192,12 +193,21 @@ func parseErrorResponse(resp *http.Response) error {
 }
 
 // parseCredentialErrorResponse is parseErrorResponse for a request whose body
-// carried credentials. It reads both of Vantagepoint's error shapes as usual,
-// but will not quote an unrecognized body: a gateway that answers a POST with
-// an error page echoing the submitted form would otherwise copy the password
-// and client secret into an error that reaches logs and the weekly report.
-func parseCredentialErrorResponse(resp *http.Response) error {
-	return parseErrorResponseBody(resp, false)
+// carried credentials, which are passed in as secrets.
+//
+// It reads both of Vantagepoint's error shapes as usual, but will not quote an
+// unrecognized body, and redacts the secrets from whatever reason it does
+// produce. A gateway that answers a POST with a page echoing the submitted form
+// would otherwise copy the password and client secret into an error that
+// reaches logs and the weekly report, and it can do that inside a JSON error
+// shape as easily as in an HTML page.
+func parseCredentialErrorResponse(resp *http.Response, secrets ...string) error {
+	err := parseErrorResponseBody(resp, false)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		apiErr.redact(secrets)
+	}
+	return err
 }
 
 func parseErrorResponseBody(resp *http.Response, quoteBody bool) error {

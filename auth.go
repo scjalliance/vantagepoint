@@ -98,9 +98,16 @@ func (c *Client) requestToken(ctx context.Context, form url.Values) (*tokenInfo,
 		// parser. Decoding it straight into an APIError used to succeed with
 		// every field empty, and a rejected login carried no reason at all.
 		//
-		// The credential variant: this request posted the password and client
-		// secret, so an unrecognized body is never quoted back.
-		return nil, parseCredentialErrorResponse(resp)
+		// The credential variant: this request posted the password, the client
+		// secret, and on a refresh the refresh token. An unrecognized body is
+		// never quoted back, and any of those values echoed inside a recognized
+		// one is redacted. Read from the form so every grant type is covered by
+		// the values it actually sent.
+		return nil, parseCredentialErrorResponse(resp,
+			form.Get("password"),
+			form.Get("client_secret"),
+			form.Get("refresh_token"),
+		)
 	}
 
 	var tok tokenInfo

@@ -1,6 +1,7 @@
 package vantagepoint
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -139,6 +140,118 @@ func TestTokenErrorDoesNotQuoteUnrecognizedBody(t *testing.T) {
 	}
 }
 
+// Withholding the raw body is not enough on its own. A gateway can answer in
+// Vantagepoint's own error shape, and an echoed request then arrives inside a
+// field the parser reads and reports as the reason.
+func TestTokenErrorRedactsEchoedCredentials(t *testing.T) {
+	const (
+		password     = "hunter2-should-never-appear"
+		clientSecret = "client-secret-should-never-appear"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		// A gateway echoing the rejected request inside the JSON error shape.
+		fmt.Fprintf(w, `{"error":"invalid_request","error_description":%q}`,
+			"rejected request: "+string(body))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", clientSecret)
+	err := c.Authenticate(context.Background(), "user", password)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	if strings.Contains(err.Error(), password) {
+		t.Errorf("the password reached the error: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), clientSecret) {
+		t.Errorf("the client secret reached the error: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), redactedMarker) {
+		t.Errorf("error = %q, want the redaction marker", err.Error())
+	}
+}
+
+// A refresh posts the refresh token rather than the password, so the redaction
+// has to follow whatever the form actually carried.
+func TestRefreshErrorRedactsRefreshToken(t *testing.T) {
+	const refreshToken = "refresh-token-should-never-appear"
+
+	var issued bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !issued {
+			issued = true
+			fmt.Fprintf(w, `{"access_token":"t","token_type":"bearer","expires_in":3600,"refresh_token":%q}`, refreshToken)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"message":%q}`, "rejected: "+string(body))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", "secret")
+	if err := c.Authenticate(context.Background(), "user", "test-password-value"); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	err := c.RefreshToken(context.Background())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), refreshToken) {
+		t.Errorf("the refresh token reached the error: %q", err.Error())
+	}
+}
+
+// A server that sends a detail but no message is still telling the caller
+// something. The status-line fallback must not overwrite it.
+func TestParseAPIErrorKeepsServerDetail(t *testing.T) {
+	err := parseAPIError(http.StatusForbidden, []byte(`{"detail":"account locked"}`), true)
+
+	if err.Detail != "account locked" {
+		t.Errorf("Detail = %q, want the server's detail kept", err.Detail)
+	}
+	if !strings.Contains(err.Error(), "account locked") {
+		t.Errorf("Error() = %q, want the detail rendered", err.Error())
+	}
+}
+
+// Replacing an invalid byte with U+FFFD grows it from one byte to three, so
+// sanitizing after the length cap would let the snippet run past its bound.
+func TestParseAPIErrorBoundsSnippetAfterSanitizing(t *testing.T) {
+	body := bytes.Repeat([]byte{0xff}, 4000)
+
+	err := parseAPIError(http.StatusBadGateway, body, true)
+
+	if len(err.Detail) > maxErrorBodySnippet+len(snippetEllipsis) {
+		t.Errorf("Detail is %d bytes, want it bounded to %d", len(err.Detail), maxErrorBodySnippet+len(snippetEllipsis))
+	}
+	if !utf8.ValidString(err.Detail) {
+		t.Errorf("Detail is not valid UTF-8: %q", err.Detail)
+	}
+}
+
+// A body that opens with continuation bytes must not back the cut all the way
+// to zero and leave nothing but the ellipsis.
+func TestParseAPIErrorKeepsContentWhenBodyStartsMidRune(t *testing.T) {
+	body := append(bytes.Repeat([]byte{0x80}, maxErrorBodySnippet+10), []byte("tail")...)
+
+	err := parseAPIError(http.StatusBadGateway, body, true)
+
+	if strings.TrimSuffix(err.Detail, snippetEllipsis) == "" {
+		t.Errorf("Detail = %q, want some content before the marker", err.Detail)
+	}
+	if !utf8.ValidString(err.Detail) {
+		t.Errorf("Detail is not valid UTF-8: %q", err.Detail)
+	}
+}
+
 // Withholding the body applies only to the credential path. A REST endpoint
 // still quotes what arrived, which is usually what identifies the bad hop.
 func TestRESTErrorStillQuotesUnrecognizedBody(t *testing.T) {
@@ -154,7 +267,7 @@ func TestRESTErrorStillQuotesUnrecognizedBody(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "db", "id", "secret")
-	if err := c.Authenticate(context.Background(), "user", "pass"); err != nil {
+	if err := c.Authenticate(context.Background(), "user", "test-password-value"); err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
@@ -212,7 +325,7 @@ func TestAuthenticateReportsServerReason(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "db", "id", "secret")
-	err := c.Authenticate(context.Background(), "user", "pass")
+	err := c.Authenticate(context.Background(), "user", "test-password-value")
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -239,7 +352,7 @@ func TestRequestReportsServerReason(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "db", "id", "secret")
-	if err := c.Authenticate(context.Background(), "user", "pass"); err != nil {
+	if err := c.Authenticate(context.Background(), "user", "test-password-value"); err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
 

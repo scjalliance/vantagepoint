@@ -96,17 +96,50 @@ func parseAPIError(statusCode int, body []byte, quoteBody bool) *APIError {
 
 	if message == "" {
 		message = fmt.Sprintf("request failed with status %d", statusCode)
-		switch {
-		case quoteBody:
-			if snippet := bodySnippet(body); snippet != "" {
-				detail = snippet
+		// Only fill an empty detail. A body like {"detail":"account locked"}
+		// has no message but does carry the reason, and overwriting it with
+		// boilerplate would throw away the only useful thing in the response.
+		if detail == "" {
+			switch {
+			case quoteBody:
+				detail = bodySnippet(body)
+			case len(bytes.TrimSpace(body)) > 0:
+				detail = withheldBodyDetail
 			}
-		case len(bytes.TrimSpace(body)) > 0:
-			detail = withheldBodyDetail
 		}
 	}
 
 	return &APIError{StatusCode: statusCode, Message: message, Detail: detail}
+}
+
+// minRedactableSecret is the shortest value redact will look for.
+//
+// Substring redaction cannot tell a secret from a coincidence, and below this
+// length the coincidence is the likely case: a four-character password of
+// "pass" turns "Please update the password" into "Please update the
+// [redacted]word", mangling the one sentence the caller needs to read. Eight
+// characters is past the point where an accidental match is plausible, and no
+// real Vantagepoint API credential is shorter.
+const minRedactableSecret = 8
+
+// redactedMarker replaces a secret found in an error message.
+const redactedMarker = "[redacted]"
+
+// redact removes the given secrets from an error built from a response to a
+// request that carried them.
+//
+// Withholding an unrecognized body is not enough on its own: a gateway can
+// answer in Vantagepoint's own error shape, and an echoed request would then
+// arrive inside "message" or "error_description" and be reported as the reason.
+// This is the second line, applied whatever shape the body took.
+func (e *APIError) redact(secrets []string) {
+	for _, secret := range secrets {
+		if len(secret) < minRedactableSecret {
+			continue
+		}
+		e.Message = strings.ReplaceAll(e.Message, secret, redactedMarker)
+		e.Detail = strings.ReplaceAll(e.Detail, secret, redactedMarker)
+	}
 }
 
 // bodySnippet returns a bounded, single-line quote of an unrecognized response
@@ -122,18 +155,22 @@ func bodySnippet(body []byte) string {
 	// Collapsed to one line: this ends up in a log line and in an email, and a
 	// multi-line HTML dump would bury the surrounding context.
 	s = strings.Join(strings.Fields(s), " ")
+	// Sanitized before measuring, not after. A body that was never UTF-8, such
+	// as a binary payload from a confused gateway, grows when each invalid byte
+	// becomes a three-byte U+FFFD, so capping first would let the result run
+	// past the bound it was just trimmed to.
+	s = strings.ToValidUTF8(s, "�")
 	if len(s) > maxErrorBodySnippet {
-		// Back up to a rune boundary first: cutting at a fixed byte offset
-		// splits a multi-byte rune and leaves the tail invalid.
+		// Back up to a rune boundary: cutting at a fixed byte offset would
+		// split a multi-byte rune and leave the tail invalid. s is valid UTF-8
+		// by now, so this walks at most three bytes.
 		cut := maxErrorBodySnippet
 		for cut > 0 && !utf8.RuneStart(s[cut]) {
 			cut--
 		}
 		s = s[:cut] + snippetEllipsis
 	}
-	// A body that was never UTF-8 to begin with, such as a binary payload from
-	// a confused gateway, still has to come out well-formed.
-	return strings.ToValidUTF8(s, "�")
+	return s
 }
 
 // Error implements the error interface for APIError.
