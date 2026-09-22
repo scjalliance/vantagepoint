@@ -180,15 +180,24 @@ func (c *Client) RawGet(ctx context.Context, path string, q *Query, result any) 
 	return c.get(ctx, path, q, result)
 }
 
+// maxErrorBodyRead bounds how much of an error response is read before it is
+// parsed. An error body is a sentence or a small JSON object; anything larger
+// is a misrouted page, and reading it in full would cost memory for no
+// diagnostic gain.
+const maxErrorBodyRead = 64 << 10
+
 // parseErrorResponse reads an error response body and returns an appropriate APIError.
 func parseErrorResponse(resp *http.Response) error {
-	var apiErr APIError
-	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
-		apiErr = APIError{
+	// Read rather than stream-decode, so parseAPIError can try both of
+	// Vantagepoint's error shapes and still quote the raw body if it is
+	// neither.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyRead))
+	if err != nil {
+		return &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    fmt.Sprintf("request failed with status %d", resp.StatusCode),
+			Detail:     fmt.Sprintf("the error body could not be read: %v", err),
 		}
 	}
-	apiErr.StatusCode = resp.StatusCode
-	return &apiErr
+	return parseAPIError(resp.StatusCode, body)
 }
