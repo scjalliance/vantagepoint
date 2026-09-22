@@ -281,6 +281,32 @@ func TestTokenErrorCatchesEncodedEchoBesideStrayPercent(t *testing.T) {
 	}
 }
 
+// A gateway need not re-encode the way the form did. Mixing '+' for spaces
+// with a lowercase percent escape for another character matches neither the
+// plain secret nor Go's QueryEscape spelling of it.
+func TestTokenErrorCatchesMixedPlusAndPercentEcho(t *testing.T) {
+	const password = "secret pass/word"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"message":"rejected user=x&password=secret+pass%2fword"}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
+	err := c.Authenticate(context.Background(), "user", password)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "secret+pass") {
+		t.Errorf("the encoded password reached the error: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), echoedCredentialsDetail) {
+		t.Errorf("error = %q, want the withheld-response detail", err.Error())
+	}
+}
+
 func TestTolerantUnescape(t *testing.T) {
 	for _, tt := range []struct {
 		in, want string
