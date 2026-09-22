@@ -218,11 +218,21 @@ func parseErrorResponseBody(resp *http.Response, quoteBody bool, secrets []strin
 	}
 	apiErr := parseAPIError(resp.StatusCode, body, quoteBody)
 
+	// A short secret is worth matching exactly where the request carried it.
+	// quoteBody is false on that path and only there, so it selects the floor
+	// as well: an eight-character password is realistic and would otherwise
+	// reach the error through error_description untouched.
+	minLen := minDetectableSecret
+	if !quoteBody {
+		minLen = noSecretLengthFloor
+	}
+
 	// Judged on the raw body and on what came out of it. A JSON encoder is free
-	// to write "P&ssw0rd" for "P&ssw0rd", which the raw bytes do not match
-	// but the decoded message does; checking only the parsed fields would in
-	// turn miss an echo in a body shape the parser ignored.
-	if containsSecret(body, secrets) || containsSecret([]byte(apiErr.Message+"\x00"+apiErr.Detail), secrets) {
+	// to escape characters it need not, writing & for "&", which the raw
+	// bytes do not match but the decoded message does; checking only the parsed
+	// fields would in turn miss an echo in a body shape the parser ignored.
+	if containsSecret(body, secrets, minLen) ||
+		containsSecret([]byte(apiErr.Message+"\x00"+apiErr.Detail), secrets, minLen) {
 		return &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    fmt.Sprintf("request failed with status %d", resp.StatusCode),

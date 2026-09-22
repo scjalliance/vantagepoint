@@ -312,6 +312,38 @@ func TestTokenErrorCatchesMixedPlusAndPercentEcho(t *testing.T) {
 	}
 }
 
+// A password short enough to fall under the REST path's length floor still has
+// to be caught where the request actually posted it.
+func TestTokenErrorCatchesShortPassword(t *testing.T) {
+	const password = "hunter2"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":"invalid_grant","error_description":"invalid password hunter2"}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "db", "id", "test-client-secret")
+	err := c.Authenticate(context.Background(), "user", password)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Errorf("the password reached the error: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), echoedCredentialsDetail) {
+		t.Errorf("error = %q, want the withheld-response detail", err.Error())
+	}
+}
+
+// An empty secret must never match, or every error on that path is withheld.
+func TestContainsSecretIgnoresEmptySecrets(t *testing.T) {
+	if containsSecret([]byte("anything at all"), []string{""}, noSecretLengthFloor) {
+		t.Error("an empty secret matched")
+	}
+}
+
 func TestTolerantUnescape(t *testing.T) {
 	for _, tt := range []struct {
 		in, want string
@@ -414,12 +446,19 @@ func TestParseAPIErrorKeepsServerDetail(t *testing.T) {
 // Replacing an invalid byte with U+FFFD grows it from one byte to three, so
 // sanitizing after the length cap would let the snippet run past its bound.
 func TestParseAPIErrorBoundsSnippetAfterSanitizing(t *testing.T) {
-	body := bytes.Repeat([]byte{0xff}, 4000)
+	// Alternating, not a solid run: ToValidUTF8 collapses each run of invalid
+	// bytes into one U+FFFD, so 4000 solid 0xff bytes become three bytes and
+	// never reach the truncation branch at all. Separated by valid bytes, each
+	// one really does grow from one byte to three.
+	body := bytes.Repeat([]byte{0xff, 'a'}, 2000)
 
 	err := parseAPIError(http.StatusBadGateway, body, true)
 
 	if len(err.Detail) > maxErrorBodySnippet+len(snippetEllipsis) {
 		t.Errorf("Detail is %d bytes, want it bounded to %d", len(err.Detail), maxErrorBodySnippet+len(snippetEllipsis))
+	}
+	if !strings.HasSuffix(err.Detail, snippetEllipsis) {
+		t.Errorf("Detail = %q, want the truncation branch to have run", err.Detail)
 	}
 	if !utf8.ValidString(err.Detail) {
 		t.Errorf("Detail is not valid UTF-8: %q", err.Detail)
@@ -429,12 +468,16 @@ func TestParseAPIErrorBoundsSnippetAfterSanitizing(t *testing.T) {
 // A body that opens with continuation bytes must not back the cut all the way
 // to zero and leave nothing but the ellipsis.
 func TestParseAPIErrorKeepsContentWhenBodyStartsMidRune(t *testing.T) {
-	body := append(bytes.Repeat([]byte{0x80}, maxErrorBodySnippet+10), []byte("tail")...)
+	// Again alternating, so the body is long enough after sanitizing to be cut.
+	body := append(bytes.Repeat([]byte{0x80, 'x'}, maxErrorBodySnippet), []byte("tail")...)
 
 	err := parseAPIError(http.StatusBadGateway, body, true)
 
 	if strings.TrimSuffix(err.Detail, snippetEllipsis) == "" {
 		t.Errorf("Detail = %q, want some content before the marker", err.Detail)
+	}
+	if !strings.HasSuffix(err.Detail, snippetEllipsis) {
+		t.Errorf("Detail = %q, want the truncation branch to have run", err.Detail)
 	}
 	if !utf8.ValidString(err.Detail) {
 		t.Errorf("Detail is not valid UTF-8: %q", err.Detail)

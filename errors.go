@@ -117,14 +117,24 @@ func parseAPIError(statusCode int, body []byte, quoteBody bool) *APIError {
 // request had sent in confidence.
 const echoedCredentialsDetail = "the response repeated credentials from the request, so it is withheld in full"
 
-// minDetectableSecret is the shortest value containsSecret will look for.
+// minDetectableSecret is the shortest value containsSecret will look for on a
+// request that did not itself carry the secret in its body.
 //
 // Substring matching cannot tell a secret from a coincidence, and a short
 // value is nearly all coincidence: a one-character token matches every body
 // containing that letter, which would withhold the reason from every error.
-// Below this length the check is skipped rather than allowed to fire on
-// everything. Real Vantagepoint credentials and bearer tokens are far longer.
-const minDetectableSecret = 8
+// The only secret on that path is the bearer token, which is far longer than
+// this, so the floor costs nothing and stops a degenerate value from
+// suppressing every message.
+//
+// The credential path uses noSecretLengthFloor instead. There the request
+// posted the password itself, so a short one is exactly the case that needs
+// catching, and a false positive costs one withheld error body against a
+// leaked password.
+const (
+	minDetectableSecret = 8
+	noSecretLengthFloor = 1
+)
 
 // containsSecret reports whether body carries any of the given secrets.
 //
@@ -139,7 +149,7 @@ const minDetectableSecret = 8
 // contain a short secret, turning "Please update the password" into "Please
 // update the [redacted]word". Deciding once whether the response is tainted,
 // and dropping the whole thing when it is, keeps every untainted reason intact.
-func containsSecret(body []byte, secrets []string) bool {
+func containsSecret(body []byte, secrets []string, minLen int) bool {
 	s := string(body)
 	// Three spellings, because an echo can come back encoded any way the
 	// gateway likes rather than the way the form sent it: as-is, percent-decoded
@@ -149,8 +159,8 @@ func containsSecret(body []byte, secrets []string) bool {
 	//
 	// The '+' variant risks calling an innocent body an echo. That costs one
 	// withheld error body; missing a real echo costs a credential, so the
-	// asymmetry decides it. minDetectableSecret keeps the false-positive rate
-	// negligible in practice.
+	// asymmetry decides it. The caller's minLen floor keeps the false-positive
+	// rate negligible in practice.
 	//
 	// The '+' replacement happens before the unescape, not after, so a secret
 	// containing a literal '+' (which a form encodes as %2B) is not mangled
@@ -158,7 +168,7 @@ func containsSecret(body []byte, secrets []string) bool {
 	haystacks := [3]string{s, tolerantUnescape(s), tolerantUnescape(strings.ReplaceAll(s, "+", " "))}
 
 	for _, secret := range secrets {
-		if len(secret) < minDetectableSecret {
+		if len(secret) < minLen {
 			continue
 		}
 		encoded := url.QueryEscape(secret)
@@ -233,10 +243,12 @@ func bodySnippet(body []byte) string {
 	// Collapsed to one line: this ends up in a log line and in an email, and a
 	// multi-line HTML dump would bury the surrounding context.
 	s = strings.Join(strings.Fields(s), " ")
-	// Sanitized before measuring, not after. A body that was never UTF-8, such
-	// as a binary payload from a confused gateway, grows when each invalid byte
-	// becomes a three-byte U+FFFD, so capping first would let the result run
-	// past the bound it was just trimmed to.
+	// Sanitized before measuring, not after. ToValidUTF8 replaces each run of
+	// invalid bytes with a single three-byte U+FFFD, so a body whose bad bytes
+	// are separated by good ones grows by up to three times, and capping first
+	// would let the result run past the bound it was just trimmed to. A solid
+	// run of invalid bytes shrinks instead, which is why a test for this has to
+	// alternate.
 	s = strings.ToValidUTF8(s, "�")
 	if len(s) > maxErrorBodySnippet {
 		// Back up to a rune boundary: cutting at a fixed byte offset would
